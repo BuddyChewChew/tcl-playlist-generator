@@ -12,6 +12,7 @@ DEVICE_ID = '1776786148042-4c4uc'
 BASE_URL = "https://gateway-prod.ideonow.com"
 IMAGE_BASE = "https://tcl-channel-cdn.ideonow.com"
 ORIGIN = "https://tcltv.plus"
+EPG_URL = "https://raw.githubusercontent.com/BuddyChewChew/tcl-playlist-generator/refs/heads/main/tcl_epg.xml"
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -97,7 +98,6 @@ def fetch_data():
         for ch in data.get("channels", []):
             bid = str(ch.get("bundle_id") or ch.get("id"))
             if bid not in channels_map:
-                # Resolve the actual M3U8 URL immediately
                 stream = resolve_stream(bid, ch.get("source"), ch.get("media", ""))
                 channels_map[bid] = {
                     "id": bid, "name": ch.get("name"), "logo": f"{IMAGE_BASE}{ch.get('logo_color')}" if ch.get('logo_color') else "",
@@ -111,9 +111,9 @@ def fetch_data():
 
 # --- File Generation ---
 def generate_files(channels_map, stubs):
-    # Build M3U8
+    # Build M3U8 with the specific x-tvg-url header
     with open("tcl.m3u8", "w", encoding="utf-8") as f:
-        f.write("#EXTM3U\n")
+        f.write(f'#EXTM3U x-tvg-url="{EPG_URL}"\n')
         for ch in channels_map.values():
             f.write(f'#EXTINF:-1 tvg-id="{ch["id"]}" tvg-logo="{ch["logo"]}" group-title="{ch["category"]}",{ch["name"]}\n')
             f.write(f'{ch["stream"]}\n')
