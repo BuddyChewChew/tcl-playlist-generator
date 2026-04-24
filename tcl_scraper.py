@@ -3,7 +3,6 @@ import re
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode, urlparse, parse_qs
 
 # --- Configuration & Constants ---
 COUNTRY_CODE = 'US'
@@ -111,7 +110,7 @@ def fetch_data():
 
 # --- File Generation ---
 def generate_files(channels_map, stubs):
-    # Build M3U8 with the specific x-tvg-url header
+    # Build M3U8
     with open("tcl.m3u8", "w", encoding="utf-8") as f:
         f.write(f'#EXTM3U x-tvg-url="{EPG_URL}"\n')
         for ch in channels_map.values():
@@ -129,9 +128,33 @@ def generate_files(channels_map, stubs):
         start = p["start"].replace("-", "").replace(":", "").replace("Z", " +0000")
         stop = p["end"].replace("-", "").replace(":", "").replace("Z", " +0000")
         
+        # Parse titles for Season/Episode/Sub-title data
+        title, season, episode, sub_title = parse_tcl_title(
+            p.get("title"), 
+            p.get("season"), 
+            p.get("episode")
+        )
+        
         prog_el = ET.SubElement(root, "programme", start=start, stop=stop, channel=bid)
-        ET.SubElement(prog_el, "title").text = p.get("title", "No Title")
-        if p.get("desc"): ET.SubElement(prog_el, "desc").text = p["desc"]
+        ET.SubElement(prog_el, "title").text = title or "No Title"
+        
+        if sub_title:
+            ET.SubElement(prog_el, "sub-title").text = sub_title
+            
+        if p.get("desc"):
+            ET.SubElement(prog_el, "desc").text = p["desc"]
+        
+        # Add Season/Episode info if available
+        if season is not None and episode is not None:
+            # XMLTV format uses 0-based numbering for the attribute: .S.E.
+            # But text format S01 E01 is often better for general players
+            ep_num = ET.SubElement(prog_el, "episode-num", system="common")
+            ep_num.text = f"S{season} E{episode}"
+            
+        # Add Rating
+        rating = normalize_rating(p.get("rating"))
+        rating_el = ET.SubElement(prog_el, "rating", system="VCHIP")
+        ET.SubElement(rating_el, "value").text = rating
         
     tree = ET.ElementTree(root)
     tree.write("tcl_epg.xml", encoding="utf-8", xml_declaration=True)
