@@ -27,5 +27,5 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add tcl.m3u8 tcl_epg.xml
-          git commit -m "Update TCL playlist and EPG" || exit 0
+          git commit -m "Update TCL playlist and EPG with integrated URL" || exit 0
           git push
