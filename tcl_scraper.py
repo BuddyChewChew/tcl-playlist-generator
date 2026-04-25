@@ -38,21 +38,27 @@ _RATING_NORM = {
 }
 
 def parse_tcl_title(raw, api_season, api_episode):
-    if not raw: return raw, api_season, api_episode, None
+    if not raw:
+        return raw, api_season, api_episode, None
     s = raw.strip()
     m = _TCL_COLON_RE.match(s)
     if m:
         return m.group(1).strip(), int(m.group(2)), api_episode, _TCL_TRAILING_CODE.sub('', m.group(3)).strip() or None
     m = _TCL_DASH_RE.match(s)
     if m:
-        return m.group(1).strip(), int(m.group(2)) if m.group(2) else api_season, int(m.group(3)) if m.group(3) else api_episode, m.group(4).strip().strip('"') if m.group(4) else None
+        return (m.group(1).strip(),
+                int(m.group(2)) if m.group(2) else api_season,
+                int(m.group(3)) if m.group(3) else api_episode,
+                m.group(4).strip().strip('"') if m.group(4) else None)
     if api_season is None and api_episode is None:
         m = _TCL_PLAIN_DASH_RE.match(s)
-        if m: return m.group(1).strip(), None, None, m.group(2).strip() or None
+        if m:
+            return m.group(1).strip(), None, None, m.group(2).strip() or None
     return s, api_season, api_episode, None
 
 def normalize_rating(raw):
-    if not raw: return "TV-NR"
+    if not raw:
+        return "TV-NR"
     base = raw.strip().split()[0].upper()
     return _RATING_NORM.get(base, "TV-NR")
 
@@ -92,20 +98,26 @@ def fetch_data():
         
         try:
             data = session.get(f"{BASE_URL}/api/metadata/v1/epg/programlist/by/category", params=params).json()
-        except: continue
+        except Exception as e:
+            logger.warning(f"Failed to fetch category {cat_id}: {e}")
+            continue
 
         for ch in data.get("channels", []):
             bid = str(ch.get("bundle_id") or ch.get("id"))
             if bid not in channels_map:
                 stream = resolve_stream(bid, ch.get("source"), ch.get("media", ""))
                 channels_map[bid] = {
-                    "id": bid, "name": ch.get("name"), "logo": f"{IMAGE_BASE}{ch.get('logo_color')}" if ch.get('logo_color') else "",
-                    "stream": stream, "category": cat_name, "programs": []
+                    "id": bid,
+                    "name": ch.get("name"),
+                    "logo": f"{IMAGE_BASE}{ch.get('logo_color')}" if ch.get('logo_color') else "",
+                    "stream": stream,
+                    "category": cat_name,
                 }
             
             for prog in ch.get("programs", []):
                 stubs.append((bid, prog))
 
+    logger.info(f"Fetched {len(channels_map)} channels and {len(stubs)} program entries")
     return channels_map, stubs
 
 # --- File Generation ---
@@ -117,47 +129,46 @@ def generate_files(channels_map, stubs):
             f.write(f'#EXTINF:-1 tvg-id="{ch["id"]}" tvg-logo="{ch["logo"]}" group-title="{ch["category"]}",{ch["name"]}\n')
             f.write(f'{ch["stream"]}\n')
     
-    # Build XML EPG
+    # Build XML EPG (FIXED timestamps + richer data)
     root = ET.Element("tv")
     for ch in channels_map.values():
         channel_el = ET.SubElement(root, "channel", id=ch["id"])
         ET.SubElement(channel_el, "display-name").text = ch["name"]
-        if ch["logo"]: ET.SubElement(channel_el, "icon", src=ch["logo"])
+        if ch["logo"]:
+            ET.SubElement(channel_el, "icon", src=ch["logo"])
 
     for bid, p in stubs:
-        start = p["start"].replace("-", "").replace(":", "").replace("Z", " +0000")
-        stop = p["end"].replace("-", "").replace(":", "").replace("Z", " +0000")
+        # FIXED: Proper XMLTV time format (no 'T')
+        start_str = p["start"].replace("-", "").replace("T", "").replace(":", "").replace("Z", " +0000")
+        stop_str = p["end"].replace("-", "").replace("T", "").replace(":", "").replace("Z", " +0000")
         
-        # Parse titles for Season/Episode/Sub-title data
-        title, season, episode, sub_title = parse_tcl_title(
-            p.get("title"), 
-            p.get("season"), 
-            p.get("episode")
-        )
+        prog_el = ET.SubElement(root, "programme", start=start_str, stop=stop_str, channel=bid)
         
-        prog_el = ET.SubElement(root, "programme", start=start, stop=stop, channel=bid)
-        ET.SubElement(prog_el, "title").text = title or "No Title"
+        title = p.get("title", "No Title")
+        api_season = p.get("season")
+        api_episode = p.get("episode")
         
-        if sub_title:
-            ET.SubElement(prog_el, "sub-title").text = sub_title
-            
+        clean_title, season, episode, subtitle = parse_tcl_title(title, api_season, api_episode)
+        
+        ET.SubElement(prog_el, "title").text = clean_title
+        if subtitle:
+            ET.SubElement(prog_el, "sub-title").text = subtitle
         if p.get("desc"):
             ET.SubElement(prog_el, "desc").text = p["desc"]
         
-        # Add Season/Episode info if available
-        if season is not None and episode is not None:
-            # XMLTV format uses 0-based numbering for the attribute: .S.E.
-            # But text format S01 E01 is often better for general players
-            ep_num = ET.SubElement(prog_el, "episode-num", system="common")
-            ep_num.text = f"S{season} E{episode}"
-            
-        # Add Rating
-        rating = normalize_rating(p.get("rating"))
-        rating_el = ET.SubElement(prog_el, "rating", system="VCHIP")
-        ET.SubElement(rating_el, "value").text = rating
+        # Add episode info for Tivimate
+        if season is not None or episode is not None:
+            ep_num = ET.SubElement(prog_el, "episode-num", system="onscreen")
+            ep_num.text = f"S{season or 0:02d}E{episode or 0:02d}"
         
+        # Add rating
+        rating_val = normalize_rating(p.get("rating"))
+        rating_el = ET.SubElement(prog_el, "rating", system="VCHIP")
+        ET.SubElement(rating_el, "value").text = rating_val
+
     tree = ET.ElementTree(root)
     tree.write("tcl_epg.xml", encoding="utf-8", xml_declaration=True)
+    logger.info(f"Generated EPG with {len(stubs)} programs")
 
 if __name__ == "__main__":
     channels, programs = fetch_data()
