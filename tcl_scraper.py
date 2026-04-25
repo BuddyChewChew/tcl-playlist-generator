@@ -68,7 +68,7 @@ def fetch_data():
     livetab = session.get(f"{BASE_URL}/api/metadata/v2/livetab", params=get_common_params()).json()
     
     channels_map = {}
-    program_map = {}   # program_id -> full details
+    program_map = {}   # program_id variants -> full details
     stubs = []         # (bid, basic_prog)
     
     now = datetime.now(timezone.utc)
@@ -77,7 +77,7 @@ def fetch_data():
         "end": (now + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
-    # Step 1: Fetch all categories and basic programs
+    # Step 1: Fetch categories and basic programs
     for line in livetab.get("lines", []):
         cat_id, cat_name = line["id"], line.get("name", "General")
         logger.info(f"Fetching category: {cat_name}")
@@ -102,64 +102,83 @@ def fetch_data():
                     }
                 
                 for prog in ch.get("programs", []):
-                    prog_id = prog.get("id")
-                    if prog_id:
+                    if prog.get("id"):
                         stubs.append((bid, prog))
         except Exception as e:
             logger.warning(f"Category {cat_id} failed: {e}")
 
-    # Step 2: Batch fetch detailed program info (FIXED)
+    # Step 2: Batch fetch detailed program info with improved ID matching
     if stubs:
-        unique_ids = list({str(p[1].get("id")) for p in stubs if p[1].get("id")})
-        logger.info(f"Fetching details for {len(unique_ids)} unique programs...")
+        unique_ids = set()
+        for _, p in stubs:
+            pid = p.get("id")
+            if pid:
+                pid_str = str(pid)
+                unique_ids.add(pid_str)
+                # Add common composite variants
+                if ':' in pid_str:
+                    parts = pid_str.split(':')
+                    unique_ids.add(parts[0])
+                    if len(parts) >= 2:
+                        unique_ids.add(':'.join(parts[:2]))
+                    if len(parts) >= 3:
+                        unique_ids.add(':'.join(parts[:3]))
+
+        unique_ids = list(unique_ids)
+        logger.info(f"Fetching details for {len(unique_ids)} unique program ID variants (from {len(stubs)} stubs)...")
 
         batch_size = 40
         for i in range(0, len(unique_ids), batch_size):
             batch = unique_ids[i:i + batch_size]
             ids_param = ",".join(batch)
 
-            # Critical: include common params so we get rich "desc" fields
             params = get_common_params()
             params["ids"] = ids_param
 
             try:
-                detail_resp = session.get(
-                    f"{BASE_URL}/api/metadata/v1/epg/program/detail",
-                    params=params,
-                    timeout=30
-                ).json()
+                detail_resp = session.get(f"{BASE_URL}/api/metadata/v1/epg/program/detail", params=params, timeout=30).json()
 
                 count_added = 0
                 if isinstance(detail_resp, list):
                     for det in detail_resp:
                         if isinstance(det, dict) and "id" in det:
-                            prog_id = det["id"]
-                            program_map[prog_id] = det
+                            det_id = str(det["id"])
+                            program_map[det_id] = det
                             count_added += 1
+                            # Store under variant keys for better lookup
+                            if ':' in det_id:
+                                parts = det_id.split(':')
+                                program_map[parts[0]] = det
+                                if len(parts) >= 2:
+                                    program_map[':'.join(parts[:2])] = det
+                                if len(parts) >= 3:
+                                    program_map[':'.join(parts[:3])] = det
                 elif isinstance(detail_resp, dict) and "id" in detail_resp:
-                    program_map[detail_resp["id"]] = detail_resp
+                    det_id = str(detail_resp["id"])
+                    program_map[det_id] = detail_resp
                     count_added = 1
+                    if ':' in det_id:
+                        parts = det_id.split(':')
+                        program_map[parts[0]] = detail_resp
+                        if len(parts) >= 2: program_map[':'.join(parts[:2])] = detail_resp
+                        if len(parts) >= 3: program_map[':'.join(parts[:3])] = detail_resp
 
-                logger.info(f"  → Fetched batch of {len(batch)} → added {count_added} details")
+                logger.info(f"  → Batch {i//batch_size + 1}: added {count_added} details")
 
-                # Debug sample on first successful batch
-                if detail_resp and i == 0 and count_added > 0:
+                if i == 0 and count_added > 0:
                     sample = detail_resp[0] if isinstance(detail_resp, list) else detail_resp
-                    logger.info(f"  Sample detail keys: {sorted(sample.keys())}")
-                    if "desc" in sample and sample.get("desc"):
-                        desc_preview = (sample["desc"][:200] + "...") if len(sample["desc"]) > 200 else sample["desc"]
-                        logger.info(f"  Sample 'desc' found: {desc_preview}")
-                    else:
-                        logger.warning(f"  No 'desc' in sample! Keys: {sorted(sample.keys())}")
+                    logger.info(f"  Sample keys: {sorted(sample.keys())}")
+                    if sample.get("desc"):
+                        preview = sample["desc"][:200] + "..." if len(sample["desc"]) > 200 else sample["desc"]
+                        logger.info(f"  Sample rich desc: {preview}")
 
             except Exception as e:
-                logger.warning(f"Detail batch {i//batch_size + 1} failed: {e}")
-                logger.debug(traceback.format_exc())
+                logger.warning(f"Detail batch failed: {e}")
 
     logger.info(f"Total: {len(channels_map)} channels, {len(stubs)} programs, {len(program_map)} with details")
     return channels_map, stubs, program_map
 
-# --- File Generation ---
+# --- File Generation (unchanged except better desc priority) ---
 def generate_files(channels_map, stubs, program_map):
     logger.info("Generating M3U8 and EPG...")
 
@@ -177,10 +196,21 @@ def generate_files(channels_map, stubs, program_map):
             ET.SubElement(channel_el, "icon", src=ch["logo"])
 
     desc_count = 0
+    rich_desc_count = 0
     for bid, p in stubs:
-        prog_id = p.get("id")
-        detail = program_map.get(prog_id) if prog_id else None
-        
+        prog_id = str(p.get("id")) if p.get("id") else None
+        detail = None
+        if prog_id:
+            # Try exact + variant lookups
+            detail = program_map.get(prog_id)
+            if not detail and ':' in prog_id:
+                parts = prog_id.split(':')
+                for length in range(1, len(parts)+1):
+                    variant = ':'.join(parts[:length])
+                    if variant in program_map:
+                        detail = program_map[variant]
+                        break
+
         start_str = p["start"].replace("-", "").replace("T", "").replace(":", "").replace("Z", " +0000")
         stop_str = p["end"].replace("-", "").replace("T", "").replace(":", "").replace("Z", " +0000")
         
@@ -193,10 +223,13 @@ def generate_files(channels_map, stubs, program_map):
         if subtitle or p.get("subtitle"):
             ET.SubElement(prog_el, "sub-title").text = subtitle or p.get("subtitle")
         
-        # Use detailed desc when available
+        # Priority: rich detail desc > basic prog desc > channel desc
         desc = ""
         if detail and detail.get("desc"):
             desc = detail["desc"].strip()
+            rich_desc_count += 1
+        elif p.get("desc"):
+            desc = p.get("desc", "").strip()
         elif channels_map.get(bid, {}).get("description"):
             desc = channels_map[bid]["description"].strip()
         
@@ -204,7 +237,6 @@ def generate_files(channels_map, stubs, program_map):
             ET.SubElement(prog_el, "desc").text = desc
             desc_count += 1
         
-        # Episode info
         if season or episode:
             ep_num = ET.SubElement(prog_el, "episode-num", system="onscreen")
             ep_num.text = f"S{season or 0:02d}E{episode or 0:02d}"
@@ -215,7 +247,7 @@ def generate_files(channels_map, stubs, program_map):
 
     tree = ET.ElementTree(root)
     tree.write("tcl_epg.xml", encoding="utf-8", xml_declaration=True)
-    logger.info(f"EPG generated — {desc_count} programs with descriptions")
+    logger.info(f"EPG generated — {desc_count} programs with descriptions ({rich_desc_count} rich from detail API)")
 
 if __name__ == "__main__":
     try:
