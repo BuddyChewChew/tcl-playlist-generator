@@ -105,30 +105,56 @@ def fetch_data():
                     prog_id = prog.get("id")
                     if prog_id:
                         stubs.append((bid, prog))
-                        # We'll fetch details later
         except Exception as e:
             logger.warning(f"Category {cat_id} failed: {e}")
 
-    # Step 2: Batch fetch detailed program info
+    # Step 2: Batch fetch detailed program info (FIXED)
     if stubs:
-        unique_ids = list({p[1].get("id") for p in stubs if p[1].get("id")})
+        unique_ids = list({str(p[1].get("id")) for p in stubs if p[1].get("id")})
         logger.info(f"Fetching details for {len(unique_ids)} unique programs...")
-        
-        batch_size = 50  # Adjust if needed
+
+        batch_size = 40
         for i in range(0, len(unique_ids), batch_size):
-            batch = unique_ids[i:i+batch_size]
+            batch = unique_ids[i:i + batch_size]
             ids_param = ",".join(batch)
+
+            # Critical: include common params so we get rich "desc" fields
+            params = get_common_params()
+            params["ids"] = ids_param
+
             try:
-                detail_resp = session.get(f"{BASE_URL}/api/metadata/v1/epg/program/detail", 
-                                        params={"ids": ids_param}, timeout=30).json()
-                
+                detail_resp = session.get(
+                    f"{BASE_URL}/api/metadata/v1/epg/program/detail",
+                    params=params,
+                    timeout=30
+                ).json()
+
+                count_added = 0
                 if isinstance(detail_resp, list):
                     for det in detail_resp:
                         if isinstance(det, dict) and "id" in det:
-                            program_map[det["id"]] = det
-                logger.info(f"  → Fetched batch of {len(batch)} details")
+                            prog_id = det["id"]
+                            program_map[prog_id] = det
+                            count_added += 1
+                elif isinstance(detail_resp, dict) and "id" in detail_resp:
+                    program_map[detail_resp["id"]] = detail_resp
+                    count_added = 1
+
+                logger.info(f"  → Fetched batch of {len(batch)} → added {count_added} details")
+
+                # Debug sample on first successful batch
+                if detail_resp and i == 0 and count_added > 0:
+                    sample = detail_resp[0] if isinstance(detail_resp, list) else detail_resp
+                    logger.info(f"  Sample detail keys: {sorted(sample.keys())}")
+                    if "desc" in sample and sample.get("desc"):
+                        desc_preview = (sample["desc"][:200] + "...") if len(sample["desc"]) > 200 else sample["desc"]
+                        logger.info(f"  Sample 'desc' found: {desc_preview}")
+                    else:
+                        logger.warning(f"  No 'desc' in sample! Keys: {sorted(sample.keys())}")
+
             except Exception as e:
-                logger.warning(f"Detail batch failed: {e}")
+                logger.warning(f"Detail batch {i//batch_size + 1} failed: {e}")
+                logger.debug(traceback.format_exc())
 
     logger.info(f"Total: {len(channels_map)} channels, {len(stubs)} programs, {len(program_map)} with details")
     return channels_map, stubs, program_map
@@ -167,12 +193,12 @@ def generate_files(channels_map, stubs, program_map):
         if subtitle or p.get("subtitle"):
             ET.SubElement(prog_el, "sub-title").text = subtitle or p.get("subtitle")
         
-        # Priority: detailed desc > channel desc
+        # Use detailed desc when available
         desc = ""
         if detail and detail.get("desc"):
-            desc = detail["desc"]
+            desc = detail["desc"].strip()
         elif channels_map.get(bid, {}).get("description"):
-            desc = channels_map[bid]["description"]
+            desc = channels_map[bid]["description"].strip()
         
         if desc:
             ET.SubElement(prog_el, "desc").text = desc
