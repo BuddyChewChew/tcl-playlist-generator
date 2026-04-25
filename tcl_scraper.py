@@ -24,7 +24,7 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
 })
 
-# --- Title Parsing (kept from before) ---
+# --- Title Parsing ---
 _TCL_COLON_RE = re.compile(r'^(.+?)\s+S(\d+):\s+(.+)$', re.IGNORECASE)
 _TCL_TRAILING_CODE = re.compile(r'\s+\d+$')
 _TCL_DASH_RE = re.compile(r'^(.+?)\s+S(\d+)(?:\s+E(\d+))?(?:\s*[-–]\s*"?(.+?)"?\s*)?$', re.IGNORECASE)
@@ -93,12 +93,15 @@ def fetch_data():
             bid = str(ch.get("bundle_id") or ch.get("id"))
             if bid not in channels_map:
                 stream = resolve_stream(bid, ch.get("source"), ch.get("media", ""))
+                channel_desc = ch.get("description", "").strip()
+                
                 channels_map[bid] = {
                     "id": bid,
                     "name": ch.get("name"),
                     "logo": f"{IMAGE_BASE}{ch.get('logo_color')}" if ch.get('logo_color') else "",
                     "stream": stream,
                     "category": cat_name,
+                    "description": channel_desc if len(channel_desc) > 20 else ""  # only keep meaningful descriptions
                 }
             
             for prog in ch.get("programs", []):
@@ -144,14 +147,10 @@ def generate_files(channels_map, stubs):
         if sub:
             ET.SubElement(prog_el, "sub-title").text = sub
         
-        # Description - try multiple possible keys
-        desc = (p.get("desc") or 
-                p.get("description") or 
-                p.get("synopsis") or 
-                p.get("subtitle") or 
-                "")
-        if desc and len(desc.strip()) > 10:   # avoid very short text
-            ET.SubElement(prog_el, "desc").text = desc.strip()
+        # Use channel description as program description
+        ch_desc = channels_map.get(bid, {}).get("description", "")
+        if ch_desc:
+            ET.SubElement(prog_el, "desc").text = ch_desc
             desc_count += 1
         
         # Episode number
@@ -166,7 +165,7 @@ def generate_files(channels_map, stubs):
 
     tree = ET.ElementTree(root)
     tree.write("tcl_epg.xml", encoding="utf-8", xml_declaration=True)
-    logger.info(f"Generated EPG with {len(stubs)} programs ({desc_count} with descriptions)")
+    logger.info(f"Generated EPG with {len(stubs)} programs ({desc_count} with channel descriptions)")
 
 if __name__ == "__main__":
     channels, programs = fetch_data()
