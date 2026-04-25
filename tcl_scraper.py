@@ -24,18 +24,11 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
 })
 
-# --- Regex & Normalization Logic ---
+# --- Title Parsing (kept from before) ---
 _TCL_COLON_RE = re.compile(r'^(.+?)\s+S(\d+):\s+(.+)$', re.IGNORECASE)
 _TCL_TRAILING_CODE = re.compile(r'\s+\d+$')
 _TCL_DASH_RE = re.compile(r'^(.+?)\s+S(\d+)(?:\s+E(\d+))?(?:\s*[-–]\s*"?(.+?)"?\s*)?$', re.IGNORECASE)
 _TCL_PLAIN_DASH_RE = re.compile(r'^(.+?)\s{1,2}-\s+(.+)$')
-
-_RATING_NORM = {
-    'TVY': 'TV-Y', 'TV Y': 'TV-Y', 'TVY7': 'TV-Y7', 'TV Y7': 'TV-Y7',
-    'TVG': 'TV-G', 'TV G': 'TV-G', 'TVPG': 'TV-PG', 'TV PG': 'TV-PG',
-    'TV14': 'TV-14', 'TV 14': 'TV-14', 'TVMA': 'TV-MA', 'TV MA': 'TV-MA',
-    'TVNR': 'TV-NR', 'TV NR': 'TV-NR', 'NR': 'TV-NR', 'NA': 'TV-NR', 'UNRATED': 'TV-NR',
-}
 
 def parse_tcl_title(raw, api_season, api_episode):
     if not raw:
@@ -55,12 +48,6 @@ def parse_tcl_title(raw, api_season, api_episode):
         if m:
             return m.group(1).strip(), None, None, m.group(2).strip() or None
     return s, api_season, api_episode, None
-
-def normalize_rating(raw):
-    if not raw:
-        return "TV-NR"
-    base = raw.strip().split()[0].upper()
-    return _RATING_NORM.get(base, "TV-NR")
 
 def get_common_params():
     return {
@@ -129,7 +116,7 @@ def generate_files(channels_map, stubs):
             f.write(f'#EXTINF:-1 tvg-id="{ch["id"]}" tvg-logo="{ch["logo"]}" group-title="{ch["category"]}",{ch["name"]}\n')
             f.write(f'{ch["stream"]}\n')
     
-    # Build XML EPG (FIXED timestamps + richer data)
+    # Build XML EPG
     root = ET.Element("tv")
     for ch in channels_map.values():
         channel_el = ET.SubElement(root, "channel", id=ch["id"])
@@ -137,8 +124,8 @@ def generate_files(channels_map, stubs):
         if ch["logo"]:
             ET.SubElement(channel_el, "icon", src=ch["logo"])
 
+    desc_count = 0
     for bid, p in stubs:
-        # FIXED: Proper XMLTV time format (no 'T')
         start_str = p["start"].replace("-", "").replace("T", "").replace(":", "").replace("Z", " +0000")
         stop_str = p["end"].replace("-", "").replace("T", "").replace(":", "").replace("Z", " +0000")
         
@@ -151,24 +138,35 @@ def generate_files(channels_map, stubs):
         clean_title, season, episode, subtitle = parse_tcl_title(title, api_season, api_episode)
         
         ET.SubElement(prog_el, "title").text = clean_title
-        if subtitle:
-            ET.SubElement(prog_el, "sub-title").text = subtitle
-        if p.get("desc"):
-            ET.SubElement(prog_el, "desc").text = p["desc"]
         
-        # Add episode info for Tivimate
+        # Subtitle
+        sub = subtitle or p.get("subtitle")
+        if sub:
+            ET.SubElement(prog_el, "sub-title").text = sub
+        
+        # Description - try multiple possible keys
+        desc = (p.get("desc") or 
+                p.get("description") or 
+                p.get("synopsis") or 
+                p.get("subtitle") or 
+                "")
+        if desc and len(desc.strip()) > 10:   # avoid very short text
+            ET.SubElement(prog_el, "desc").text = desc.strip()
+            desc_count += 1
+        
+        # Episode number
         if season is not None or episode is not None:
             ep_num = ET.SubElement(prog_el, "episode-num", system="onscreen")
             ep_num.text = f"S{season or 0:02d}E{episode or 0:02d}"
         
-        # Add rating
-        rating_val = normalize_rating(p.get("rating"))
+        # Rating
+        rating_val = p.get("rating", "TV-NR")
         rating_el = ET.SubElement(prog_el, "rating", system="VCHIP")
         ET.SubElement(rating_el, "value").text = rating_val
 
     tree = ET.ElementTree(root)
     tree.write("tcl_epg.xml", encoding="utf-8", xml_declaration=True)
-    logger.info(f"Generated EPG with {len(stubs)} programs")
+    logger.info(f"Generated EPG with {len(stubs)} programs ({desc_count} with descriptions)")
 
 if __name__ == "__main__":
     channels, programs = fetch_data()
