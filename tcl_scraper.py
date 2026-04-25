@@ -77,7 +77,7 @@ def fetch_data():
         "end": (now + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
-    # Step 1: Fetch categories and basic programs
+    # Step 1: Fetch all categories and basic programs
     for line in livetab.get("lines", []):
         cat_id, cat_name = line["id"], line.get("name", "General")
         logger.info(f"Fetching category: {cat_name}")
@@ -115,14 +115,11 @@ def fetch_data():
             if pid:
                 pid_str = str(pid)
                 unique_ids.add(pid_str)
-                # Add common composite variants
+                # Add composite variants for better matching
                 if ':' in pid_str:
                     parts = pid_str.split(':')
-                    unique_ids.add(parts[0])
-                    if len(parts) >= 2:
-                        unique_ids.add(':'.join(parts[:2]))
-                    if len(parts) >= 3:
-                        unique_ids.add(':'.join(parts[:3]))
+                    for length in range(1, len(parts) + 1):
+                        unique_ids.add(':'.join(parts[:length]))
 
         unique_ids = list(unique_ids)
         logger.info(f"Fetching details for {len(unique_ids)} unique program ID variants (from {len(stubs)} stubs)...")
@@ -145,23 +142,21 @@ def fetch_data():
                             det_id = str(det["id"])
                             program_map[det_id] = det
                             count_added += 1
-                            # Store under variant keys for better lookup
+                            # Store under all useful variants
                             if ':' in det_id:
                                 parts = det_id.split(':')
-                                program_map[parts[0]] = det
-                                if len(parts) >= 2:
-                                    program_map[':'.join(parts[:2])] = det
-                                if len(parts) >= 3:
-                                    program_map[':'.join(parts[:3])] = det
+                                for length in range(1, len(parts) + 1):
+                                    variant = ':'.join(parts[:length])
+                                    program_map[variant] = det
                 elif isinstance(detail_resp, dict) and "id" in detail_resp:
                     det_id = str(detail_resp["id"])
                     program_map[det_id] = detail_resp
                     count_added = 1
                     if ':' in det_id:
                         parts = det_id.split(':')
-                        program_map[parts[0]] = detail_resp
-                        if len(parts) >= 2: program_map[':'.join(parts[:2])] = detail_resp
-                        if len(parts) >= 3: program_map[':'.join(parts[:3])] = detail_resp
+                        for length in range(1, len(parts) + 1):
+                            variant = ':'.join(parts[:length])
+                            program_map[variant] = detail_resp
 
                 logger.info(f"  → Batch {i//batch_size + 1}: added {count_added} details")
 
@@ -178,7 +173,7 @@ def fetch_data():
     logger.info(f"Total: {len(channels_map)} channels, {len(stubs)} programs, {len(program_map)} with details")
     return channels_map, stubs, program_map
 
-# --- File Generation (unchanged except better desc priority) ---
+# --- File Generation ---
 def generate_files(channels_map, stubs, program_map):
     logger.info("Generating M3U8 and EPG...")
 
@@ -201,11 +196,11 @@ def generate_files(channels_map, stubs, program_map):
         prog_id = str(p.get("id")) if p.get("id") else None
         detail = None
         if prog_id:
-            # Try exact + variant lookups
+            # Try exact match first, then variant fallbacks
             detail = program_map.get(prog_id)
             if not detail and ':' in prog_id:
                 parts = prog_id.split(':')
-                for length in range(1, len(parts)+1):
+                for length in range(1, len(parts) + 1):
                     variant = ':'.join(parts[:length])
                     if variant in program_map:
                         detail = program_map[variant]
@@ -225,22 +220,28 @@ def generate_files(channels_map, stubs, program_map):
         
         # Priority: rich detail desc > basic prog desc > channel desc
         desc = ""
-        if detail and detail.get("desc"):
+        if detail and isinstance(detail.get("desc"), str) and detail["desc"].strip():
             desc = detail["desc"].strip()
             rich_desc_count += 1
-        elif p.get("desc"):
-            desc = p.get("desc", "").strip()
+        elif isinstance(p.get("desc"), str) and p["desc"].strip():
+            desc = p["desc"].strip()
         elif channels_map.get(bid, {}).get("description"):
             desc = channels_map[bid]["description"].strip()
-        
+
         if desc:
-            ET.SubElement(prog_el, "desc").text = desc
-            desc_count += 1
-        
+            try:
+                ET.SubElement(prog_el, "desc").text = desc
+                desc_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to write desc for {clean_title}: {e}")
+        # else: no description available
+
+        # Episode numbering
         if season or episode:
             ep_num = ET.SubElement(prog_el, "episode-num", system="onscreen")
             ep_num.text = f"S{season or 0:02d}E{episode or 0:02d}"
         
+        # Rating
         rating = detail.get("rating") if detail else p.get("rating", "TV-NR")
         rating_el = ET.SubElement(prog_el, "rating", system="VCHIP")
         ET.SubElement(rating_el, "value").text = rating
