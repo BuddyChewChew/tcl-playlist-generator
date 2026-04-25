@@ -3,6 +3,7 @@ import re
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+import traceback
 
 # --- Configuration & Constants ---
 COUNTRY_CODE = 'US'
@@ -13,7 +14,7 @@ IMAGE_BASE = "https://tcl-channel-cdn.ideonow.com"
 ORIGIN = "https://tcltv.plus"
 EPG_URL = "https://raw.githubusercontent.com/BuddyChewChew/tcl-playlist-generator/refs/heads/main/tcl_epg.xml"
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 session = requests.Session()
@@ -51,9 +52,13 @@ def parse_tcl_title(raw, api_season, api_episode):
 
 def get_common_params():
     return {
-        "userId": DEVICE_ID, "device_type": "web", "device_model": "web",
-        "device_id": DEVICE_ID, "app_version": "1.0",
-        "country_code": COUNTRY_CODE, "state_code": STATE_CODE,
+        "userId": DEVICE_ID,
+        "device_type": "web",
+        "device_model": "web",
+        "device_id": DEVICE_ID,
+        "app_version": "1.0",
+        "country_code": COUNTRY_CODE,
+        "state_code": STATE_CODE,
     }
 
 # --- API Methods ---
@@ -63,11 +68,12 @@ def resolve_stream(bundle_id, source, media):
     try:
         resp = session.post(f"{BASE_URL}/api/metadata/v1/format-stream-url", params=params, json=payload, timeout=20)
         return resp.json().get("stream_url") or media
-    except:
+    except Exception as e:
+        logger.warning(f"Stream resolve failed for {bundle_id}: {e}")
         return media
 
 def fetch_data():
-    logger.info("Fetching channel list...")
+    logger.info("=== Starting TCL API scrape ===")
     livetab = session.get(f"{BASE_URL}/api/metadata/v2/livetab", params=get_common_params()).json()
     channels_map = {}
     stubs = []
@@ -78,40 +84,61 @@ def fetch_data():
         "end": (now + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
+    logger.info(f"Time range: {range_params['start']} → {range_params['end']}")
+    logger.info(f"Found {len(livetab.get('lines', []))} categories in livetab")
+
     for line in livetab.get("lines", []):
-        cat_id, cat_name = line["id"], line.get("name", "General")
+        cat_id = line["id"]
+        cat_name = line.get("name", "Unknown")
+        logger.info(f"Fetching category: {cat_name} (ID: {cat_id})")
+
         params = get_common_params()
         params.update({"category_id": cat_id, **range_params})
         
         try:
-            data = session.get(f"{BASE_URL}/api/metadata/v1/epg/programlist/by/category", params=params).json()
-        except Exception as e:
-            logger.warning(f"Failed to fetch category {cat_id}: {e}")
-            continue
+            data = session.get(f"{BASE_URL}/api/metadata/v1/epg/programlist/by/category", 
+                             params=params, timeout=30).json()
+            
+            channels_in_cat = data.get("channels", [])
+            logger.info(f"  → Got {len(channels_in_cat)} channels in this category")
 
-        for ch in data.get("channels", []):
-            bid = str(ch.get("bundle_id") or ch.get("id"))
-            if bid not in channels_map:
-                stream = resolve_stream(bid, ch.get("source"), ch.get("media", ""))
+            for ch in channels_in_cat:
+                bid = str(ch.get("bundle_id") or ch.get("id"))
                 channel_desc = ch.get("description", "").strip()
                 
-                channels_map[bid] = {
-                    "id": bid,
-                    "name": ch.get("name"),
-                    "logo": f"{IMAGE_BASE}{ch.get('logo_color')}" if ch.get('logo_color') else "",
-                    "stream": stream,
-                    "category": cat_name,
-                    "description": channel_desc if len(channel_desc) > 20 else ""  # only keep meaningful descriptions
-                }
-            
-            for prog in ch.get("programs", []):
-                stubs.append((bid, prog))
+                if bid not in channels_map:
+                    stream = resolve_stream(bid, ch.get("source"), ch.get("media", ""))
+                    channels_map[bid] = {
+                        "id": bid,
+                        "name": ch.get("name"),
+                        "logo": f"{IMAGE_BASE}{ch.get('logo_color')}" if ch.get('logo_color') else "",
+                        "stream": stream,
+                        "category": cat_name,
+                        "description": channel_desc if len(channel_desc) > 30 else ""  # only keep good descriptions
+                    }
+                    if channel_desc:
+                        logger.info(f"    → Channel '{ch.get('name')}' has description ({len(channel_desc)} chars)")
 
-    logger.info(f"Fetched {len(channels_map)} channels and {len(stubs)} program entries")
+                # Log program structure on first channel of first category
+                if len(stubs) < 5 and channels_in_cat.index(ch) == 0:
+                    if ch.get("programs"):
+                        prog = ch["programs"][0]
+                        logger.info(f"    Sample program keys: {list(prog.keys())}")
+
+                for prog in ch.get("programs", []):
+                    stubs.append((bid, prog))
+
+        except Exception as e:
+            logger.error(f"Failed to fetch category {cat_id} ({cat_name}): {e}")
+            logger.debug(traceback.format_exc())
+
+    logger.info(f"=== Scrape complete: {len(channels_map)} unique channels, {len(stubs)} total program entries ===")
     return channels_map, stubs
 
 # --- File Generation ---
 def generate_files(channels_map, stubs):
+    logger.info("Generating M3U8 and EPG files...")
+
     # Build M3U8
     with open("tcl.m3u8", "w", encoding="utf-8") as f:
         f.write(f'#EXTM3U x-tvg-url="{EPG_URL}"\n')
@@ -135,19 +162,14 @@ def generate_files(channels_map, stubs):
         prog_el = ET.SubElement(root, "programme", start=start_str, stop=stop_str, channel=bid)
         
         title = p.get("title", "No Title")
-        api_season = p.get("season")
-        api_episode = p.get("episode")
-        
-        clean_title, season, episode, subtitle = parse_tcl_title(title, api_season, api_episode)
+        clean_title, season, episode, subtitle = parse_tcl_title(title, p.get("season"), p.get("episode"))
         
         ET.SubElement(prog_el, "title").text = clean_title
         
-        # Subtitle
-        sub = subtitle or p.get("subtitle")
-        if sub:
-            ET.SubElement(prog_el, "sub-title").text = sub
+        if subtitle or p.get("subtitle"):
+            ET.SubElement(prog_el, "sub-title").text = subtitle or p.get("subtitle")
         
-        # Use channel description as program description
+        # Channel-level description as fallback
         ch_desc = channels_map.get(bid, {}).get("description", "")
         if ch_desc:
             ET.SubElement(prog_el, "desc").text = ch_desc
@@ -165,9 +187,15 @@ def generate_files(channels_map, stubs):
 
     tree = ET.ElementTree(root)
     tree.write("tcl_epg.xml", encoding="utf-8", xml_declaration=True)
-    logger.info(f"Generated EPG with {len(stubs)} programs ({desc_count} with channel descriptions)")
+    
+    logger.info(f"EPG generated with {len(stubs)} programs — {desc_count} have channel descriptions")
+    logger.info("Files saved: tcl.m3u8 and tcl_epg.xml")
 
 if __name__ == "__main__":
-    channels, programs = fetch_data()
-    generate_files(channels, programs)
-    logger.info("Done! Generated tcl.m3u8 and tcl_epg.xml")
+    try:
+        channels, programs = fetch_data()
+        generate_files(channels, programs)
+        logger.info("=== TCL Scraper finished successfully ===")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        logger.debug(traceback.format_exc())
